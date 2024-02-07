@@ -15,6 +15,9 @@ static int fdProgrammer;
 
 enum Flags_t
 {
+	FLAG_DOWNLOAD = 1 << 4,
+	FLAG_DL_EXTENDED = 1 << 5,
+	FLAG_DL_EXTPAGE = 1 << 6,
 	FLAG_DOWNLOAD_MASK = 0xF0,
 	FLAG_UPLOAD_MASK = ~0xF0,
 	FLAG_VERIFY = 1<<0,
@@ -93,21 +96,26 @@ static void RxCallback(const struct PartialReadData* data)
 int Usage(const char* argv0)
 {
 	FILE* out = isatty(STDOUT_FILENO) ? stdout : stderr;
-	fprintf(out, "USAGE: %s FILE [-d|--dump|-u|--upload] [-i|--input=INPUTFILE] [-a|--address=START] [-s|--skip=SKIP] [-c|--count=COUNT] [-o|--output=OUTFILE] [-v|--verify] [-r|--retain]\n", argv0);
-	fprintf(out, "       cat dataToUpload.bin | %s FILE\n", argv0);
-	fprintf(out, "       %s FILE < dataToUpload.bin\n", argv0);
-	fprintf(out, "       %s FILE > dumpedData.bin\n", argv0);
-	fprintf(out, "If an input or output file is not specified, the standard input or output will be assumed.\n");
-	fprintf(out, "Options:\n");
-	fprintf(out, "-d|--dump\tExtracts and dumps the currently flashed data to a given file or STDOUT.\n");
-	fprintf(out, "-u|--upload\tUploads (flashes) the EEPROM with the supplied data.\n");
-	fprintf(out, "-a|--address\tSpecifies the start address of the EEPROM to start dumping from/uploading to.\n");
-	fprintf(out, "-s|--skip\tWhen uploading, specifies the amount of data to skip from the source file.\n");
-	fprintf(out, "-c|--count\tSpecifies the amount of data to dump/upload.\n");
-	fprintf(out, "-i|--input\tSpecifies the input file to use when uploading.\n");
-	fprintf(out, "-o|--output\tSpecifies the output file to use when dumping.\n");
-	fprintf(out, "-v|--verify\tVerifies data that is written.\n");
-	fprintf(out, "-r|--retain\tRetains any data that lies within blocks of the given data range but that is outside of the data range itself. This is important because the EEPROM gets written in blocks of a certain size, and any unspecified data will be erased.\n");
+	fprintf(out, "USAGE: %s FILE [options]\n", argv0);
+	fprintf(out, "       cat dataToUpload.bin | %s FILE [options]\n", argv0);
+	fprintf(out, "       %s FILE [options] < dataToUpload.bin\n", argv0);
+	fprintf(out, "       %s FILE [options] > dumpedData.bin\n\n", argv0);
+	fputs("If an input or output file is not specified, the standard input or output will be assumed.\n\n", out);
+	fputs("Options:\n", out);
+	fputs("-d|--dump\tExtracts and dumps the currently flashed data to a given file or STDOUT.\n", out);
+	fputs("-u|--upload\tUploads (flashes) the EEPROM with the supplied data.\n", out);
+	fputs("-a|--address\tSpecifies the start address of the EEPROM to start dumping from/uploading to.\n", out);
+	fputs("-s|--skip\tWhen uploading, specifies the amount of data to skip from the source file.\n", out);
+	fputs("-c|--count\tSpecifies the amount of data to dump/upload.\n", out);
+	fputs("-i|--input\tSpecifies the input file to use when uploading.\n", out);
+	fputs("-o|--output\tSpecifies the output file to use when dumping.\n", out);
+	fputs("-v|--verify\tVerifies data that is written.\n", out);
+	fputs("-r|--retain\tRetains any data that lies within blocks of the given data range but that is outside of the data range itself. This is important because the EEPROM gets written in blocks of a certain size, and any unspecified data will be erased.\n", out);
+	fputs("-e|--extended\tTreats the EEPROM as an extended 19-bit-addressable device. These devices cannot be written to (yet?). (See README.md for more information.)\n", out);
+	fputs("-p|--page\tSelects the page to access on a 4Mbit ROM. See README.me for more.\n", out);
+	fputs("-b|--baud\tSet the baud rate to transfer data at. Set to 0 to use the device's current baud rate. The default is 115200.\n", out);
+	fputs("--nostty\tDo not set the TTY attributes. This can be useful when the system has trouble setting the baud rate, for example.\n\n", out);
+
 	return 0;
 }
 
@@ -115,8 +123,10 @@ int main(int argc, const char* argv[])
 {
 	uint32_t start = 0;
 	uint32_t skip  = 0;
+	uint32_t baud  = 115200;
 	int32_t count  = -1;
 	uint8_t flags  = 0;
+	bool    noStty = false;
 	uint8_t tempBuffer[4];
 	int fdData = 0, fdOut = STDOUT_FILENO;
 	const char* inputfilepath = NULL;
@@ -126,14 +136,14 @@ int main(int argc, const char* argv[])
 	bool stderrCanErase;
 
 	if (!isatty(STDOUT_FILENO))
-		flags |= FLAG_DOWNLOAD_MASK;
+		flags |= FLAG_DOWNLOAD;
 
 	stderrCanErase = isatty(STDERR_FILENO);
 
 	if (argc < 2)
 	{
 Usage:
-		fprintf(stderr, "USAGE: %s FILE [-d|--dump|-u|--upload] [-i|--input=INPUTFILE] [-a|--address=START] [-s|--skip=SKIP] [-c|--count=COUNT] [-o|--output=OUTFILE] [-v|--verify] [-r|--retain]\n", argv[0]);
+		fprintf(stderr, "USAGE: %s FILE [-d|--dump|-u|--upload] [-i|--input=INPUTFILE] [-e|--extended] [-p|--page=PAGE] [-a|--address=START] [-s|--skip=SKIP] [-c|--count=COUNT] [-o|--output=OUTFILE] [-v|--verify] [-r|--retain]\n", argv[0]);
 		return 1;
 	}
 
@@ -153,41 +163,37 @@ Usage:
 				{
 					const char* argval = strchr(argv[iArg], '=');
 					const char* argname = &argv[iArg][2];
-					bool inlineValue = argval != NULL;
-
-					if (argval == NULL)
-						argval = argv[iArg + 1];
-					else
-						++argval;
+					bool inlineValue = argval != NULL; // value is provided within the current argv in `--key=value` format
+					argval = inlineValue ? (argval + 1) : argv[iArg + 1];
 
 					if (strncmp(argname, "dump", 4) == 0)
-						flags |= FLAG_DOWNLOAD_MASK;
+						flags |= FLAG_DOWNLOAD;
 					else if (strncmp(argname, "upload", 6) == 0)
 						flags &= FLAG_UPLOAD_MASK;
 					else if (strncmp(argname, "address", 5) == 0)
 					{
 						start = strtoul(argval, NULL, 0);
-						if (inlineValue) ++iArg;
+						if (!inlineValue) ++iArg;
 					}
 					else if (strncmp(argname, "skip", 5) == 0)
 					{
 						skip = strtoul(argval, NULL, 0);
-						if (inlineValue) ++iArg;
+						if (!inlineValue) ++iArg;
 					}
 					else if (strncmp(argname, "count", 5) == 0)
 					{
 						count = strtol(argval, NULL, 0);
-						if (inlineValue) ++iArg;
+						if (!inlineValue) ++iArg;
 					}
 					else if (strncmp(argname, "input", 5) == 0)
 					{
 						inputfilepath = argval;
-						if (inlineValue) ++iArg;
+						if (!inlineValue) ++iArg;
 					}
 					else if (strncmp(argname, "output", 5) == 0)
 					{
 						outputfilepath = argval;
-						if (inlineValue) ++iArg;
+						if (!inlineValue) ++iArg;
 					}
 					else if (strncmp(argname, "verify", 6) == 0)
 						flags |= FLAG_VERIFY;
@@ -195,13 +201,56 @@ Usage:
 						flags |= FLAG_RETAIN;
 					else if (strncmp(argname, "help", 4) == 0)
 						return Usage(argv[0]);
+					else if (strncmp(argname, "extended", 8) == 0)
+						flags |= FLAG_DL_EXTENDED;
+					else if (strncmp(argname, "page", 4) == 0)
+					{
+						if (strtol(argval, NULL, 0) == 0)
+							flags &= ~FLAG_DL_EXTPAGE;
+						else
+							flags |= FLAG_DL_EXTPAGE;
+						if (!inlineValue) ++iArg;
+					}
+					else if (strncmp(argname, "baud", 4) == 0)
+					{
+						baud = strtol(argval, NULL, 0);
+						if (!inlineValue) ++iArg;
+					}
+					else if (strncmp(argname, "nostty", 6) == 0)
+						noStty = true;
 					goto NextArg;
 				} break;
-				case 'd': flags |= FLAG_DOWNLOAD_MASK; break;
+				case 'd': flags |= FLAG_DOWNLOAD; break;
 				case 'u': flags &= FLAG_UPLOAD_MASK; break;
 				case 'v': flags |= FLAG_VERIFY; break;
 				case 'r': flags |= FLAG_RETAIN; break;
 				case 'h': return Usage(argv[0]);
+				case 'b':
+				{
+					if (argv[iArg][iChar+1] == '=')
+						++iChar;
+
+					if (argv[iArg][iChar+1] >= 0 && argv[iArg][iChar+1] <= '9')
+						baud = strtoul(&argv[iArg][iChar+1], NULL, 0);
+					else
+						baud = strtoul(argv[++iArg], NULL, 0);
+				} goto NextArg;
+				case 'e': flags |= FLAG_DL_EXTENDED; break;
+				case 'p':
+				{
+					if (argv[iArg][iChar+1] == '=')
+						++iChar;
+
+					long page;
+					if (argv[iArg][iChar+1] >= '0' && argv[iArg][iChar+1] <= '9')
+						page = strtol(&argv[iArg][iChar+1], NULL, 0);
+					else
+						page = strtol(argv[++iArg], NULL, 0);
+
+					if (page == 0) flags &= ~FLAG_DL_EXTPAGE;
+					else           flags |=  FLAG_DL_EXTPAGE;
+						
+				} goto NextArg;
 				case 'a':
 				{
 					if (argv[iArg][iChar+1] == '=')
@@ -261,7 +310,7 @@ NextArg:
 
 	if (outputfilepath != NULL)
 	{
-		flags |= FLAG_DOWNLOAD_MASK;
+		flags |= FLAG_DOWNLOAD;
 		fdOut = open(outputfilepath, O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH);
 	}
 
@@ -272,28 +321,34 @@ NextArg:
 		return 2;
 	}
 
-	struct termios atts;
-	if (tcgetattr(fdProgrammer, &atts) != 0)
+	if (!noStty)
 	{
-		fprintf(stderr, "Failed to get attributes for programmer device: %s\n", strerror(errno));
-		close(fdProgrammer);
-		return 3;
-	}
-	cfmakeraw(&atts);
-	cfsetispeed(&atts, B38400);
-	cfsetospeed(&atts, B38400);
-	atts.c_cc[VTIME] = 20;
-	atts.c_cc[VMIN] = 1;
-	if (tcsetattr(fdProgrammer, TCSAFLUSH, &atts) != 0)
-	{
-		fprintf(stderr, "Failed to set attributes for programmer device: %s\n", strerror(errno));
-		close(fdProgrammer);
-		return 3;
+		struct termios atts;
+		if (tcgetattr(fdProgrammer, &atts) != 0)
+		{
+			fprintf(stderr, "Failed to get attributes for programmer device: %s\n", strerror(errno));
+			close(fdProgrammer);
+			return 3;
+		}
+		cfmakeraw(&atts);
+		if (baud != 0)
+		{
+			cfsetispeed(&atts, baud);
+			cfsetospeed(&atts, baud);
+		}
+		atts.c_cc[VTIME] = 20;
+		atts.c_cc[VMIN] = 1;
+		if (tcsetattr(fdProgrammer, TCSAFLUSH, &atts) != 0)
+		{
+			fprintf(stderr, "Failed to set attributes for programmer device: %s\n", strerror(errno));
+			close(fdProgrammer);
+			return 3;
+		}
 	}
 	// MIN == 0
 	// TIME > 0
 
-	if ((flags & FLAG_DOWNLOAD_MASK) != FLAG_DOWNLOAD_MASK)
+	if ((flags & FLAG_DOWNLOAD) != FLAG_DOWNLOAD)
 	{
 		if (inputfilepath != NULL)
 		{
@@ -320,7 +375,7 @@ NextArg:
 
 	tcflush(fdProgrammer, TCIFLUSH);
 	fprintf(stderr, "%sloading %d bytes from 0x%06x. Flags = %02Xh\n",
-			(flags & FLAG_DOWNLOAD_MASK) == FLAG_DOWNLOAD_MASK ? "Down" : "Up",
+			(flags & FLAG_DOWNLOAD) == FLAG_DOWNLOAD ? "Down" : "Up",
 			count,
 			start,
 			flags);
@@ -354,7 +409,7 @@ NextArg:
 
 		unsigned int nBytesRemainingInFifo = 0;
 		int thisCount;
-		if ((flags & FLAG_DOWNLOAD_MASK) != FLAG_DOWNLOAD_MASK)
+		if ((flags & FLAG_DOWNLOAD) != FLAG_DOWNLOAD)
 		{
 			thisCount = count > 256 ? 0xFF : (count-1);
 			if ((address & 0xFF) != 0)
